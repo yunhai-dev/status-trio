@@ -83,6 +83,7 @@ CI 工具链（`macos-26` / Xcode 26.6 / Swift 6.3.3）上全绿，耗时 15m27s
 | `35718713396`（1.3.0 正式发布，`build=13`） | `Build, sign, notarize, and publish` 末尾的 appcast 发布回读（`scripts/release.sh`） | 测试、构建、签名、DMG、Release 上传、appcast 提交（`8519984`）全部成功后，PUT 完成仅 2 秒即用 Contents API 回读 `appcast.xml?ref=main`，撞上 GitHub Contents API 的最终一致性窗口，读到旧 blob 而误报 `published appcast does not contain build 13`。与工具链、代码、说明文件无关 | 回读改为带退避的重试（最多 6 次、间隔 5 秒），重试全部用尽才失败；已手动回读远端 appcast 确认 build 13 条目完整（12 titles + 12 descriptions、en 首位、edSignature 与 DMG 长度 4244534 一致），1.3.0 发布四项核验通过；重试逻辑经桩测（stale→stale→fresh 通过、恒 stale 失败并退出 1）验证，详见文末专节 |
 | `35876435136` | `Run tests` | `AppIconControllerTests.sliderBurstRepaintsTheDockIconOnce`（Swift Testing）偶发失败：`renderCount → 1` 期望 `0`（`harness.log.batteryOptions.last?.criticalThreshold → 33` 期望 `40`）。该测试模拟把 `batteryCriticalThreshold` 从 25 连续设到 40（滑块拖动），断言合并成一次尾部重绘且携带终值 40。Swift Testing 把整轮测试并行启动，runner 负载高时 `iconAppearancePublisher` 的逐次发射与 `currentAppearance` 更新被排到与存储值不同的时点，合并器的尾部重绘在 `currentAppearance` 还没推进到 40 时就抢先执行，抓到一个中间值。本机 Xcode 27 / Swift 6.4 与 CI 的 Xcode 26.6 / Swift 6.3.3 都跑这套合并逻辑，且本机 `swift test` 769/0 全绿，所以失效的是测试对「同步循环里的 16 次发射一定先于尾部重绘落地」的假设，不是产品缺陷，也与本轮蓝牙改动无关（蓝牙分支未触碰 `AppIconController` / `IconRenderCoalescer` / 电池 publisher） | 重跑同一 `version=1.3.3`、`build=16`、`publish=false` 的非发布预检 [`35877626348`](https://github.com/lingyired/status-trio/actions/runs/35877626348)：`Run tests` / `Build, sign, notarize, and publish` / `Upload release artifacts` 全绿，确认是偶发而非回归。该测试属时序敏感家族（见 `35316867111`、`35447521372`）；若日后还要根治，需让突发写入在 MainActor 上落地后再断言，不要据此误判蓝牙改动 |
 | `36332229393` | `Build, sign, notarize, and publish` | 蓝牙图标来源预检用 `version=1.4.0`，但仓库没有 `release-notes/1.4.0`：`scripts/validate-appcast-notes.sh` 在非发布时允许目录缺失并跳过校验（日志里只有一条 `::notice::`），`scripts/release.sh` 却在第 144 行硬性要求该目录存在，于是直接 `exit 1`。这是 `35375443023` 的同一模式复发，不是代码或工具链问题——Swift 6.3.3 的 `Run tests` 已通过，尚未进入 release 构建 | 不改动蓝牙代码（`0651799`），改用已有说明文件的 `version=1.3.3`、递增的 `build=17`、`publish=false` 重跑预检 [`36332507137`](https://github.com/lingyired/status-trio/actions/runs/36332507137)：`Run tests`、通用 release 构建/签名、`Upload release artifacts` 全绿（4m43s）。**发布 1.4.0 前必须先补 `release-notes/1.4.0/`（`publish=true` 需要全部 12 种语言）**，否则预检会以同一方式失败 |
+| [`39286678415`](https://github.com/lingyired/status-trio/actions/runs/39286678415)（head `44b3e06`，Dock 充电动效预检） | `Build, sign, notarize, and publish` | 使用 `version=1.6.2`，但仓库没有 `release-notes/1.6.2`。`Run tests`（XCTest 1,657 / 7 skipped / 0 failures，Swift Testing 647 / 99 suites）与 `Run native compatibility tests` 已通过；`scripts/release.sh` 在版本解析后直接报 `release notes directory does not exist`，尚未进入 release 构建。与 `35375443023` / `36332229393` 是同一门槛 | 不改产品代码，改用已有说明目录的 `version=1.6.1`、递增的 `build=2026102001`、`publish=false` 重跑预检 [`39287740763`](https://github.com/lingyired/status-trio/actions/runs/39287740763)：`Run tests`、原生兼容性测试、Universal release 构建/签名、DMG 打包与 artifact 上传全绿（13m53s），未创建 tag、Release 或 appcast 更新 |
 | （本地，非失败记录） | 本机 `swift test` | 新加的 `VolumeFeedbackTests.preferenceTreatsAMissingKeyAsEnabled` 想用 suites 断言「键不存在时按开启处理」，而 `UserDefaults(suiteName:)` 的搜索链在 suite 域之后仍会落到 `NSGlobalDomain`：全新 suite 读到的是本机 `com.apple.sound.beep.feedback`。开发机把这个开关关成 `0`（0 = 关）之后该测试即失败，CI runner 上（该键缺失）却一直是绿的——失效的是测试对「suite 隔离」的假设，不是产品行为 | 把判断拆成纯函数 `SystemVolumeFeedbackPreference.isEnabled(storedValue:)`，「缺失按开启」由它覆盖，suite 只留给显式写值的用例；顺带给两个未注入 feedback 播放器的既有 store 测试补上假播放器，免得在开关打开的机器上跑测试时真的出声。后续预检 `35851597428` 全绿 |
 | `36396172842` | `Run tests` | #30 的 Wi-Fi 居中修复把 SF Symbol 的锚点从 `canvas.midX`（60.0）改为 `artworkCenterX`（59.5），`ChargingEffectRenderingTests.nilPhaseKeepsThePreEffectStaticPixelFingerprint` 记录的静态像素基线随之改变。该用例的 `staticSnapshot` 是 `wifi.state = .off`，走 `drawOfficialSymbol(name: "wifi.slash")` 的默认 `center: wifiSymbolCenter` 分支，因此像素必然变化。本机 macOS 27 的实测新指纹为 `0ef6d48…`，但 macOS 26 CI runner 的对应值无法在本地推导，预检如实报出 `9f0c892…` | 按平台分别把基线更新为实测值：macOS 26 CI 用 `9f0c892e2602f4d4f9c541be1d93963e14d46e76f3ef24b46cd2dfbc25a22d1d`，macOS 27 本地用 `0ef6d483e344f6056fa3799f9f33bac0092246e3dbfbb3619a4666d7e9e9c190`（**替换**而非追加旧值，否则旧缺陷像素仍会被接受，守卫失效）。该失败是修复的预期效果，不是回归；同一次 run 中 380 个用例里只有这一项失败，说明新的 #30 断言在 CI 工具链上全部通过 |
 | `37936045929` | `Run tests` | #30 在 2026-10-09 于 v1.5.1 复发：此前只把 SF Symbol 的锚点从 `canvas.midX`（60.0）改到 `artworkCenterX`（59.5），但对齐的是 `NSImage.size` 的布局框。`wifi` 的可见墨迹并不在布局框中心，默认 60.8pt 时墨迹 bbox 中心比框中心左偏约 0.344pt；框居中后墨迹仍落在约 59.16，用户看到的还是偏左。修复改为测量并补偿符号墨迹的横向 side bearing，`ChargingEffectRenderingTests.nilPhaseKeepsThePreEffectStaticPixelFingerprint` 的静态像素随之变化。本机 macOS 27 实测新指纹为 `1930db1…`，macOS 26 CI runner 的对应值无法在本地推导，预检如实报出 `9dcba31…` | 按平台分别替换静态基线：macOS 26 CI 用 `9dcba3184f0953f8c173cc2f846977f01b84510a8505166bd6a8048f44d8fd97`，macOS 27 本地用 `1930db19c8a2f14400b25cf8f9228320b3d2bb9eb3f3360f93cc1e9ae8b1bf52`；旧值不能追加保留，否则修复前的偏左像素仍会被接受。该失败是预期像素变化，不是回归。同一次 run 的其他用例全绿；随后以同分支 head `4b255e5`、`version=1.5.1`、`build=25`、`publish=false` 重跑预检 [`37936688902`](https://github.com/lingyired/status-trio/actions/runs/37936688902)：`Run tests`、`Run native compatibility tests`、`Build, sign, notarize, and publish`（`publish=false`，未创建 GitHub Release、未更新 appcast）与 `Upload release artifacts` 全绿，耗时 14m48s；本机同 head `swift test` 为 583 tests / 91 suites 通过、`swift build -c release` 通过（见 `docs/issue-30-wifi-centering-analysis.md`） |
@@ -90,6 +91,8 @@ CI 工具链（`macos-26` / Xcode 26.6 / Swift 6.3.3）上全绿，耗时 15m27s
 | `36681666541`、`36687697162`（#78 iPhone 电量非发布预检） | `Run tests` | 两次都是 `BluetoothListeningModeControllerLifecycleTests` 里等 `.failed` 的用例失败：第一次只有 `testFailedWriteRollsBackThroughAReRead`（2 秒期限，`BluetoothListeningModeControllerLifecycleTests.swift:117`），把期限放宽到 5 秒后第二次反而多了一个 `testUnconfirmedWriteRollsBackToObservedMode`（`…Tests.swift:125`，两条 `XCTAssertTrue(isFailed(...))` 也一并失败）。两次失败与期限长短无关，因为失效的从来不是等待时间，而是**能看见该状态的窗口**：`.failed` 会按 `failureClearDelay` 自动清除，而这个测试 helper 把它从产品默认的 2 秒压到 30 毫秒，`waitUntil` 却每 5 毫秒才轮询一次——runner 的主 actor 只要一次延迟超过 30 毫秒，整段 `.failed` 就被跳过，5 秒期限再长也等不到。`testUnconfirmedWriteRollsBackToObservedMode` 完全不涉及 OS 错误（后端接受写入、回读仍停在 NC），纯 Swift 逻辑必然发布过 `.failed`，所以只可能是没被观察到，不是产品行为改变。第一次的「期限不够」结论由此被推翻 | 把测试 helper 的 `failureClearDelay` 改成产品默认的 2 秒（新增 `Self.failureClearDelay`），使「状态存活多久」与「轮询多久看一次」不再互相错位；`waitUntil` 的 5 秒期限保留，但注释改回真实原因（它只是卡死写入的上界）。`swift test --filter BluetoothListeningModeControllerLifecycleTests` 13 项通过（2.24 秒，两条失败用例各等满 2 秒 linger）。后续以 `version=1.3.4`、`build=21`、`publish=false` 重跑非发布预检验证 |
 
 | `36727668293`（#78 iPad 横版图标非发布预检） | `Run tests` | `AppIconControllerTests.sliderBurstRepaintsTheDockIconOnce` 再次偶发失败：`harness.log.renderCount → 1` 期望 `0`，且 `harness.log.batteryOptions.last?.criticalThreshold → 38` 期望 `40`。同一 run 里 1124 个 XCTest（6 跳过）与其余 438 个 Swift Testing 用例全绿，只此一项失败。与 `35876435136` 同根同症：该用例用同步循环连续发射 16 次阈值，假设尾部重绘必然读到终值 40，而 runner 负载高时尾部重绘会先于 `currentAppearance` 落地，抓到中间值 38。失效的是断言对发射顺序的假设，不是产品行为——失败提交 `5075e85` 只改 iPad 横版图标，不触碰 `AppIconController` / `IconRenderCoalescer` / 电池 publisher | 不改产品代码：该提交随后并入 `8a8157f`，同一工作流非发布预检 [`36728153620`](https://github.com/lingyired/status-trio/actions/runs/36728153620) 全绿。该用例属时序敏感家族（另见 `35316867111`、`35447521372`、`35876435136`），至此已在四个不同提交上偶发；若日后根治，需让突发写入在 MainActor 上落地后再断言，不要据此误判蓝牙改动 |
+| [`39427610464`](https://github.com/lingyired/status-trio/actions/runs/39427610464)（head `d299548`，蓝牙 radio 开关非发布预检） | `Run tests` | `AppIconControllerTests.visibleDockRendersStatusChanges` 偶发失败：`renderCount → 0` 期望 `1`，5 秒内没有等到合并后的 Dock 重绘。此前 XCTest 与其余 Swift Testing 用例均通过；失败提交只改蓝牙 radio 开关，不触碰 `AppIconController`、`IconPresentationViewModel` 或 `IconRenderCoalescer`。该用例和 `35447521372` 同属依赖真实 `Task.sleep` 与主 actor 排程的时序敏感家族，不能据此判定蓝牙回归 | 不改产品代码；测试改用 `ManualIconPresentationScheduler` 明确推进快照 debounce，再调用 `flushPendingPresentationForTesting()` 排空 render coalescer，断言仍为“一次可见 Dock 重绘”；定向 `swift test --filter AppIconControllerTests.visibleDockRendersStatusChanges` 通过（0.096s）。随后重跑完整本地测试、release 构建与同一非发布预检，未创建 Release 或更新 appcast |
+| [`39457652321`](https://github.com/lingyired/status-trio/actions/runs/39457652321)（head `be93f4de`，PR #124 HUAWEI 非发布预检） | `Run tests` | 4 个 Swift Testing 图标用例失败：`ChargingEffectControllerTests.batteryLevelChangesStillUpdateStaticDockArtwork`、`AppIconControllerTests.visibleDockRendersStatusChanges`、`AppIconControllerTests.ringStrokeStyleSurvivesOtherOptionChanges`、`AppIconControllerTests.connectionOptionChangeKeepsConfiguredWiFiSymbolScale`。同一 run 的 XCTest 1,769 项、7 skipped、0 failure，Swift Testing 697 项 / 103 suites 中为这 4 issues。旧测试依赖主 actor 上的真实调度和统一 5 秒 wall-clock deadline；runner 负载下快照 debounce、coalescer 尾部重绘或推进后的静态 artwork 未在期限内落地，不能判定 HUAWEI 传输逻辑回归 | 合并 main 的 #129 修复，在测试注入 `ManualIconPresentationScheduler`、`ManualEventSleeper` 和受控 charging clock，显式推进并排空待处理重绘；断言强度未降低，产品节流与 HUAWEI 写入/read-back 逻辑未修改。当前 head 本地 `swift test` 全绿（XCTest 1,759、7 skipped、0 failure；Swift Testing 697 / 103 suites），图标定向测试 66 项、`HuaweiTransportLifecycleTests` 15 项及 `Issue30WiFiAlignmentTests` 6 项均通过，`swift build -c release` 通过；仍需本节 head 的 `macos-26` / Xcode 26.6 / Swift 6.3.3 非发布预检验证 |
 | （1.4.0 正式发布，`build=17`） | — | 非失败记录。发布前先补 `release-notes/1.4.0/` 全部 12 种语言（即 `36332229393` 的缺失目录门槛），本地 `scripts/validate-appcast-notes.sh` 在 `publish=false` 与 `publish=true` 下均通过（12 titles / 12 descriptions，en 首位） | 发布工作流 [`36739480903`](https://github.com/lingyired/status-trio/actions/runs/36739480903)（`version=1.4.0`、`build=17`、`publish=true`，head `2137675`）全绿：`Validate appcast notes`、`Run tests`（1124 个 XCTest（6 跳过，0 失败）与 438 个 Swift Testing / 72 suites 全绿）、`Build, sign, notarize, and publish`、`Upload release artifacts`。Release `v1.4.0`、tag `v1.4.0`、资产 `StatusTrio-1.4.0.dmg`（5520444 字节）与远端 appcast 的 build 17 条目（12 titles + 12 descriptions、en 首位、edSignature 与 DMG 长度一致）均已核验。本仓库仍无 Developer ID 证书与公证密钥，实际为 Ad-hoc 签名 |
 
 > **本轮结束时构建不是零警告：** 上面的修复只清掉了 `weak var` 那 4 条 `WeakMutability` 和 Task 1 的 1 条 `String(cString:)`，共 5 条；剩下 **2 条**警告是 `WiFiPasswordStore.swift` 的 `kSecUseAuthenticationUIFail` / `kSecUseAuthenticationUIAllow` 弃用，属于 R-12（Keychain 加固）计划，class B，尚未开始。不要把本轮记录读成「构建已经干净」。
@@ -1117,3 +1120,132 @@ distribution due to environment protection rules.
 
 要在该分支拿到**公证版**，需要把 `distribution` environment 的 deployment branch
 规则放开（或改由受保护分支/标签触发）；管理该设置属于仓库权限变更，未擅自执行。
+
+## 39376165822：内存优化预检中的测试调度依赖
+
+- 运行：[39376165822](https://github.com/lingyired/status-trio/actions/runs/39376165822)，
+  head `04206b5`，`version=1.6.1`、`build=38`、`publish=false`，
+  CI 为 Xcode 26.6 / Swift 6.3.3；失败阶段为 `Run tests`。
+- CI XCTest 1727 项（7 skipped）通过；Swift Testing 697 项中出现 3 个 issue：
+  `StatusBarControllerVisibilityTests.testSwitchAnimatesTheMenuBarWhileTheRealBatteryIsUnplugged`
+  的两个保留动画断言，以及
+  `ChargingEffectControllerTests.batteryLevelChangesStillUpdateStaticDockArtwork` 的重绘计数断言。
+- 菜单栏根因：测试先关闭合成充电输入，再开启注入的绘图失败开关；
+  超过 50 ms coalescing interval 时，设置发布会立即重绘，已成功回到静态图。
+  原测试却仍假设失败发生在该重绘之前。为测试插入 75 ms quiet interval 后，
+  本地稳定重现相同的两个失败；将失败开关移到设置发布前并显式 drain 后，
+  同样的 quiet interval 下两项 visibility 测试通过。正式测试移除了复现用 sleep。
+- Dock 测试将 AsyncStream → store → 500 ms presentation debounce → 50 ms
+  redraw coalescer 的整条链路当作 5 秒内应自动完成的操作，仅轮询最终 renderCount。
+  失败日志没有分阶段观测，不能确定这次 CI 延迟具体落在哪一级；同一轮中
+  `visibleDockRendersStatusChanges` 通过，未获得产品绘制逻辑回归的证据。修复改为
+  注入既有 ManualIconPresentationScheduler，先验证电量进入 store 与 pending debounce，
+  显式执行 debounce，确认 scene 为 61%，再 flush redraw。保留重绘断言，
+  不延长 timeout、不修改产品节流逻辑。
+- 复验：本地菜单栏定向测试 2 项通过；修复后全量 1717 XCTest（7 skipped）和
+  697 Swift Testing / 103 suites 全部通过，Release 构建通过（33.35 秒）。
+- [39377387434](https://github.com/lingyired/status-trio/actions/runs/39377387434)
+  对修复后 head `8728003` 全部通过：CI 1727 XCTest（7 skipped）+
+  697 Swift Testing / 103 suites；native compatibility tests、双架构 Release、
+  两种 helper bundle 校验、DMG 创建及 artifact 上传均通过。仍为
+  `version=1.6.1 build=38 publish=false notarize=false`，未发版。
+
+## 39422907935：PR #123 定位权限缓存预检
+
+- 运行：[39422907935](https://github.com/lingyired/status-trio/actions/runs/39422907935)，
+  第一次 attempt，head `a1fcd448`，临时分支 `codex/preflight-pr-123`，
+  `version=1.6.0`、`build=38`、`publish=false`、`notarize=false`；
+  失败阶段为 `Run tests`，后续兼容性检查和打包未运行。
+- XCTest 1729 项（7 skipped、0 failures）全部通过，包含新增的 Wi-Fi 授权缓存测试；
+  Swift Testing 697 项 / 103 suites 报告 11 个 issue，集中在
+  `AppIconControllerTests`（4）、`IconSurfaceIntegrationTests`（6）和
+  `DockChargingEnvironmentTests`（1）。前两组主要是 5 秒内未观察到合并重绘，
+  后一组是开发充电预览尚未观察到 steady phase。
+- 根因调查：这些测试依赖主 actor 上的异步状态传播、重绘 coalescer 或真实动画时钟；
+  首次失败日志只有最终等待超时或断言，缺少各阶段观测，尚不能确定阻塞在哪一级，
+  也不能据此归因于本次 Wi-Fi 缓存改动。相关等待逻辑在 PR 中未改动。
+- 修复及验证：未修改产品代码或放宽断言；同一 head 的本地完整测试通过
+  （Xcode 27 / Swift 6.4：1719 XCTest、7 skipped、0 failures；
+  697 Swift Testing / 103 suites），相关三个测试组均通过。
+  第二次 CI attempt 全部通过：1729 XCTest（7 skipped、0 failures）、
+  697 Swift Testing / 103 suites、native compatibility tests、双架构 Release、
+  mobile battery / privileged helper bundle 校验、DMG 创建和 artifact 上传。
+  产物为 `StatusTrio-324`，包含 `StatusTrio-1.6.0.dmg`；日志确认
+  `Built … without publishing.`，使用 Ad-hoc 签名，未进行 Apple 公证，
+  未创建 Release 或更新 appcast。
+  运行间结果有差异，但仍未获得首次失败的精确阶段根因；
+  不把首次失败解释为编译器问题，也不以复验通过抹去首次失败。
+
+## 39441930496 至 39447874014：异步图标测试与部署契约假通过
+
+同一 SHA 的结果差异把测试稳定性问题与工具链兼容性区分开了：
+
+- [`39441930496`](https://github.com/lingyired/status-trio/actions/runs/39441930496)
+  成功；
+  [`39441995782`](https://github.com/lingyired/status-trio/actions/runs/39441995782)
+  对同一 head `c8c49315` 失败，失败阶段均为 `Run tests`。
+- 后续
+  [`39443852308`](https://github.com/lingyired/status-trio/actions/runs/39443852308)
+  （head `68282826`）、
+  [`39444905968`](https://github.com/lingyired/status-trio/actions/runs/39444905968)
+  （head `099baec0`）和
+  [`39447874014`](https://github.com/lingyired/status-trio/actions/runs/39447874014)
+  （head `d8a3b97c`）连续失败，Swift Testing 分别在约 6.44、6.85、6.30 秒
+  汇总失败；XCTest 已完成。失败集中在
+  `AppIconControllerTests.visibleDockRendersStatusChanges`、
+  `IconSurfaceIntegrationTests` 的多条 surface 等待、
+  `ChargingEffectControllerTests.batteryLevelChangesStillUpdateStaticDockArtwork`
+  和 `DockChargingEnvironmentTests` 的 restore/steady-phase 断言。
+- 根因不是编译器或产品渲染差异。原测试把 500 ms presentation debounce、
+  50 ms render coalescer、20 Hz charging clock 和 AsyncStream 消费绑定成一个
+  5 秒 wall-clock 等待；整套 Swift Testing 在主 actor 上并发启动时，固定窗口内
+  实际到达哪一级并不确定。失败 Run 的日志也显示多个 suite 在同一时刻启动并
+  在一个 5 秒窗口后一起报错。
+- 修复只为测试注入既有的 `ManualIconPresentationScheduler`、`IconRenderCoalescer`、
+  `ManualEventSleeper` 和受控 charging clock，先等待 store/debounce 等确定事件，
+  再显式执行 debounce、coalescer drain 和时钟帧。没有延长 timeout、删除断言、
+  skip 测试或修改产品节流逻辑；超时现在抛出包含 snapshot、store 场景、
+  pending debounce、render count 和最后渲染 scene 的错误。
+- 定向验证：最终清理后
+  `swift test --filter 'AppIconControllerTests|IconSurfaceIntegrationTests|ChargingEffectControllerTests|DockChargingEnvironmentTests'`
+  通过 66 tests / 4 suites；默认调度 10/10 轮、四个 suite 分别单独执行 3/3 轮、
+  `--parallel` 10/10 轮均通过。第一次默认 10 轮在第 8 轮捕获到
+  `mappedSettingsStayInParityAcrossMenuBarAndDock` 的真实竞态：充电场景已到
+  model，但菜单栏与 Dock 的异步交付尚未同时收敛，测试立即断言失败。修复后
+  先等待两个 surface 都交付同一 scene，再保留严格相等断言；随后 10/10 通过。
+  最终 `swift test` 连续 3 轮通过：每轮 XCTest 1719（7 skipped、0 failures）
+  和 Swift Testing 697 tests / 103 suites；`swift build -c release` 通过。
+
+同时修复了 `scripts/test-macos13-deployment-contract.sh` 的已证实假阳性：
+旧脚本在缺少 `rg` 时让 `if rg ...` 进入 false 分支，然后无条件打印
+`macOS 13 deployment contract passed` 并退出 0。用受控 fixture 在
+`PATH` 中没有 `rg`、但存在 `grep` 的环境复现了这一行为
+（旧脚本 `rg: command not found` 后仍退出 0）。新实现优先用 `rg`，不可用时
+自动回退到 `grep -E -R`，并把扫描器的 0（找到禁止常量）、1（未找到）与
+其他退出码严格区分；工具缺失和执行错误都会 fail closed。新增
+`scripts/test-macos13-deployment-contract-regressions.sh` 覆盖正常 13.0、
+禁止 15.0、显式 grep、自动 grep fallback、工具缺失和 scanner exit 2，
+并接入 release workflow 的 native compatibility step。
+
+## PR #124：华为传输发现、连接所有权与充电图层并发
+
+- DeepSeek 子任务基于 `group/auto-deepseek-v4-1-flash` 完成了独立功能审查。审查确认
+  HUAWEI 噪声控制已接入实时设备、面板行、写入与 read-back；同时发现首次状态读取失败后
+  不会重试，以及 transport 打开的 Bluetooth 连接在部分失败路径未释放。后续审查还发现
+  明确的非 HUAWEI vendor ID 会被 `FreeBuds` 名称兜底错误识别，以及取消发生在 RFCOMM
+  通道打开后时只关闭连接而未关闭通道。
+- 修复保持原有功能断言：首次无已确认状态时最多使用 150 ms、450 ms 两次有界重试；
+  已有确认模式的后续读取失败继续保留该模式。Transport 只关闭自己成功打开的设备连接，
+  并覆盖连接超时、SDP、RFCOMM、读写、取消、过期连接、`closeAll()` 与会话关闭路径；
+  预存连接保持原所有者。明确 vendor ID 优先于名称兜底。
+- 定向验证通过：华为协议、控制器、首用并发启动和生命周期共 30 项；
+  `Issue30WiFiAlignmentTests`、输出设备听音控制行、面板 task ID 与 Dock 充电恢复
+  定向测试也通过，且 `git diff --check` 通过。
+- 本轮全量 `swift test` 暴露 4 个 issue，集中在既有
+  `StatusBarChargingAnimationTickTests.steadyTicksReuseTheTemplateBaseAndThePreRenderedFrames`：
+  测试快照前观察到基础层被处理两次，从而连带有 4 个计数/对象身份断言失败。6 项充电
+  tick suite 再次运行时有 1 个同类 issue，随后单独复跑通过，说明该测试的初始呈现
+  handoff 仍与实际 `Task.sleep` 调度竞争。重试的 39 个 HUAWEI 定向测试全部通过，
+  证明本次华为代码没有引入这些计数失败。按本条记录的测试调度原则，后续以已有可控
+  presentation 调度器替换固定 sleep，保留“静止呈现只栅格化一次、稳态 tick 不重建基础层”
+  的全部计数与对象身份断言，再运行完整本地测试和非发布 CI 预检。
